@@ -14,7 +14,7 @@ MAKEFUN_INPUT_DIR=/path/to/input MAKEFUN_OUTPUT_DIR=/path/to/output python3 main
 
 Cases are UTF-8 JSON in `$MAKEFUN_INPUT_DIR` or `/input` (schema `makefun/twitch-ccu-case/v1`). Each forecast is written to `$MAKEFUN_OUTPUT_DIR/<id>.out` or `/output/<id>.out` as `{"hours":[{"hour":h,"q":[q05,q25,q50,q75,q95]}, ...]}` for hours 2–24.
 
-Claude Code session transcripts used to build this entry are in `transcripts/`, copied unmodified from the harness logs.
+Claude Code session transcripts are submitted with the official make.fun bundle, not stored in this repository.
 
 ---
 

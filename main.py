@@ -1,24 +1,28 @@
 #!/usr/bin/env python3
 """GTA VI launch-day Twitch viewers: hour-by-hour quantile forecast.
 
-Model (standard library only, deterministic, no network):
-  * For every comparable launch, take its release-day hourly curve and divide
-    by its own "hour 1", after aligning the curve so that its US-East midnight
-    unlock lands on the same hour as the target's (04:00Z under US daylight
-    time, 05:00Z otherwise).  This keeps the staggered local-midnight shape
-    (UK/Europe already in hour 1, US East jump, US West, evening peak) in place.
-  * Keep the launches that look like console midnight-local unlocks; drop
-    single-global / PC-only / early-access / free-to-play launches and any
-    curve whose hour 1 was clearly pre-unlock (day max far above hour 1).
-  * Size effect: smaller launches grow more over the day.  For each hour, a
-    weighted slope of the comparables' log ratio on log(their hour 1) is
-    fitted at runtime and shifts that hour's ratios to the target's hour-1
-    size (capped to the comparables' size range; slope bounded to [-0.5, 0]).
-  * Per hour, the log ratios form a weighted kernel mixture whose bandwidth
-    follows Silverman's rule on those ratios (capped at KERNEL_SD).  It is blended
-    with the house baseline (lognormal around the hour-1 print with log sd
-    0.15*sqrt(h-1)) with weight that grows as comparables run out, and the five
-    quantiles are read off the mixture CDF.
+Single entrypoint, Python 3.13 standard library only, deterministic, no network.
+
+Pipeline for each case
+----------------------
+1. Read the target's hour-1 print ``p`` and work in log space relative to it.
+2. Comparables.  Each comparable launch's release-day curve is re-indexed so
+   that its US-East midnight unlock sits on the same hour as the target's
+   (04:00Z under US daylight time, 05:00Z otherwise), then divided by its own
+   hour 1.  That keeps the staggered local-midnight shape (UK/Europe already in
+   hour 1, the US-East jump, US-West, the evening peak) aligned.
+   Launches that are not console midnight-local unlocks are dropped
+   (single-global, PC-only, early-access, free-to-play, ...), as is any curve
+   whose hour 1 was evidently pre-unlock (day max far above hour 1).
+3. Size effect.  Smaller launches grow more over the day.  For every hour a
+   weighted least-squares slope of log ratio on log(hour-1 viewers) is fitted,
+   clamped to [-SLOPE_CAP, 0], and used to move each comparable's ratio to the
+   target's hour-1 size (target size clamped to the comparables' range).
+4. Density.  Per hour, the shifted log ratios become a weighted Gaussian kernel
+   mixture with Silverman bandwidth (floor 0.05, cap KERNEL_SD).  The house
+   starter forecast (lognormal at p, log sd 0.15*sqrt(h-1)) is added as one
+   more component of weight PRIOR_STRENGTH, so it dominates when comparables
+   are thin.  The five quantiles are read off the mixture CDF by bisection.
 """
 import json
 import math
@@ -26,15 +30,22 @@ import os
 import re
 from datetime import date, datetime, timedelta, timezone
 
-LEVELS = [0.05, 0.25, 0.5, 0.75, 0.95]
-Z = [-1.645, -0.674, 0.0, 0.674, 1.645]
+LEVELS = (0.05, 0.25, 0.5, 0.75, 0.95)
+HOUSE_Z = (-1.645, -0.674, 0.0, 0.674, 1.645)
+HOURS = range(2, 25)
 
-# Model constants (fixed by reasoning, not tuned per practice hour).
-KERNEL_SD = 0.20          # upper bound on the per-hour kernel bandwidth
-PRIOR_STRENGTH = 3.0      # pseudo-count of the house baseline in the blend
-SLOPE_CAP = 0.5           # |size slope| bound (log ratio per log hour-1 viewers)
-MAX_DAY_RATIO = 15.0      # hour 1 below 1/15 of the day max => pre-unlock hour 1
-EXCLUDE_WORDS = (
+# Fixed model constants.
+KERNEL_SD = 0.20        # cap on the per-hour kernel bandwidth
+MIN_BW = 0.05           # floor on the per-hour kernel bandwidth
+PRIOR_STRENGTH = 3.0    # pseudo-count given to the house starter component
+SLOPE_CAP = 0.5         # bound on |d log ratio / d log hour-1|
+MIN_SLOPE_COMPS = 4     # comparables needed before fitting a size slope
+MAX_DAY_RATIO = 15.0    # day max above 15x hour 1 => hour 1 was pre-unlock
+MIN_BASE_VIEWERS = 50   # ignore comparables with a tiny hour 1
+MIN_HOURS = 12          # comparables need at least this many usable hours
+HOUSE_SD_PER_HOUR = 0.15
+
+DROP_MARKERS = (
     "single global", "single simultaneous", "simultaneous across",
     "simultaneous global", "pc only", "pc single", "early-access-contaminated",
     "free-to-play", "f2p", "tier: weak", "not a launch",
@@ -42,104 +53,159 @@ EXCLUDE_WORDS = (
 )
 
 
-def parse_ts(s):
-    return datetime.fromisoformat(s.replace("Z", "+00:00")).astimezone(timezone.utc)
+# --------------------------------------------------------------------------
+# time helpers
+# --------------------------------------------------------------------------
+def to_utc(stamp):
+    return datetime.fromisoformat(stamp.replace("Z", "+00:00")).astimezone(timezone.utc)
 
 
-def nth_sunday(year, month, n):
-    d = date(year, month, 1)
-    d += timedelta(days=(6 - d.weekday()) % 7)
-    return d + timedelta(days=7 * (n - 1))
+def _nth_sunday(year, month, n):
+    first = date(year, month, 1)
+    first_sunday = first + timedelta(days=(6 - first.weekday()) % 7)
+    return first_sunday + timedelta(weeks=n - 1)
 
 
-def us_east_unlock_offset(day):
-    """Hours after 00:00Z of the release date at which US-East midnight falls."""
-    start = nth_sunday(day.year, 3, 2)
-    end = nth_sunday(day.year, 11, 1)
-    return 4 if start <= day < end else 5
+def east_midnight_hour(day):
+    """UTC hour (on ``day``) at which US-East local midnight falls."""
+    dst = _nth_sunday(day.year, 3, 2) <= day < _nth_sunday(day.year, 11, 1)
+    return 4 if dst else 5
 
 
-def comp_weight(comp):
-    text = (str(comp.get("unlock", "")) + " " + str(comp.get("name", ""))).lower()
-    if any(w in text for w in EXCLUDE_WORDS):
-        return 0.0
-    plats = str(comp.get("platforms", "")).lower()
-    console_only = re.search(r"\bpc\b", plats) is None
-    w = 1.0 if console_only else 0.6
-    if "midnight" not in text:
-        w *= 0.7  # unverified unlock: keep, but trust less
-    return w
+# --------------------------------------------------------------------------
+# comparables
+# --------------------------------------------------------------------------
+def trust(comp):
+    """Weight given to one comparable launch (0 = drop it)."""
+    desc = "%s %s" % (comp.get("unlock", ""), comp.get("name", ""))
+    desc = desc.lower()
+    for marker in DROP_MARKERS:
+        if marker in desc:
+            return 0.0
+    has_pc = re.search(r"\bpc\b", str(comp.get("platforms", "")).lower()) is not None
+    weight = 0.6 if has_pc else 1.0
+    if "midnight" not in desc:
+        weight *= 0.7  # unlock time unverified
+    return weight
 
 
-def comp_log_ratios(comp, target_offset):
-    """Return {target_hour: log(ratio)} for hours 2..24, or None if unusable."""
-    w = comp_weight(comp)
-    if w <= 0:
-        return None, 0.0
-    day0 = parse_ts(comp["day_start"])
-    shift = target_offset - us_east_unlock_offset(day0.date())
+def hourly_series(comp):
+    """{hours after day_start: viewers} for the positive, finite rows."""
+    start = to_utc(comp["day_start"])
     series = {}
     for row in comp.get("hourly") or []:
-        v = row.get("viewers")
-        if v is None:
+        raw = row.get("viewers")
+        if raw is None:
             continue
         try:
-            v = float(v)
+            val = float(raw)
         except (TypeError, ValueError):
             continue
-        if not math.isfinite(v) or v <= 0:
-            continue
-        k = int(round((parse_ts(row["from"]) - day0).total_seconds() / 3600.0))
-        series[k] = v
-    # target hour h (1-based, offset h-1) <- comparable offset (h-1) - shift
-    base = series.get(0 - shift)
-    if base is None or base < 50:
-        return None, 0.0
-    out = {}
-    for h in range(2, 25):
-        v = series.get(h - 1 - shift)
-        if v is not None:
-            out[h] = math.log(v / base)
-    if len(out) < 12:
-        return None, 0.0
-    if max(out.values()) > math.log(MAX_DAY_RATIO):
-        return None, 0.0
-    out[0] = math.log(base)  # key 0 carries log(hour-1 viewers)
-    return out, w
+        if math.isfinite(val) and val > 0:
+            k = round((to_utc(row["from"]) - start).total_seconds() / 3600.0)
+            series[int(k)] = val
+    return start, series
 
 
-def silverman_bw(pts):
-    """Silverman's rule (weighted, robust spread) for one hour's log ratios."""
-    n_eff = sum(w for w, _ in pts) ** 2 / sum(w * w for w, _ in pts)
-    sw = sum(w for w, _ in pts)
-    m = sum(w * x for w, x in pts) / sw
-    sd = math.sqrt(sum(w * (x - m) ** 2 for w, x in pts) / sw)
-    xs = sorted(pts, key=lambda t: t[1])
-    def wq(t):
-        acc = 0.0
-        for w, x in xs:
-            acc += w
-            if acc >= t * sw:
-                return x
-        return xs[-1][1]
-    iqr = (wq(0.75) - wq(0.25)) / 1.349
+class Comparable:
+    __slots__ = ("weight", "log_base", "ratios")
+
+    def __init__(self, weight, log_base, ratios):
+        self.weight = weight
+        self.log_base = log_base   # log(hour-1 viewers)
+        self.ratios = ratios       # {target hour: log(viewers / hour 1)}
+
+
+def build_comparable(comp, target_unlock):
+    weight = trust(comp)
+    if weight <= 0:
+        return None
+    start, series = hourly_series(comp)
+    lag = target_unlock - east_midnight_hour(start.date())
+    base = series.get(-lag)
+    if base is None or base < MIN_BASE_VIEWERS:
+        return None
+    ratios = {}
+    for h in HOURS:
+        val = series.get(h - 1 - lag)
+        if val is not None:
+            ratios[h] = math.log(val / base)
+    if len(ratios) < MIN_HOURS or max(ratios.values()) > math.log(MAX_DAY_RATIO):
+        return None
+    return Comparable(weight, math.log(base), ratios)
+
+
+# --------------------------------------------------------------------------
+# size adjustment
+# --------------------------------------------------------------------------
+def size_slope(pairs):
+    """Clamped weighted LS slope from (weight, x, y) triples."""
+    total = sum(w for w, _, _ in pairs)
+    if len(pairs) < MIN_SLOPE_COMPS or total <= 0:
+        return 0.0
+    mx = sum(w * x for w, x, _ in pairs) / total
+    my = sum(w * y for w, _, y in pairs) / total
+    sxx = sum(w * (x - mx) ** 2 for w, x, _ in pairs)
+    if sxx <= 0:
+        return 0.0
+    slope = sum(w * (x - mx) * (y - my) for w, x, y in pairs) / sxx
+    return min(0.0, max(-SLOPE_CAP, slope))
+
+
+def adjust_for_size(comps, log_p):
+    if len(comps) < MIN_SLOPE_COMPS:
+        return comps
+    lo = min(c.log_base for c in comps)
+    hi = max(c.log_base for c in comps)
+    target = min(max(log_p, lo), hi)
+    slopes = {}
+    for h in HOURS:
+        slopes[h] = size_slope([(c.weight, c.log_base, c.ratios[h])
+                                for c in comps if h in c.ratios])
+    shifted = []
+    for c in comps:
+        moved = {h: r + slopes[h] * (target - c.log_base) for h, r in c.ratios.items()}
+        shifted.append(Comparable(c.weight, c.log_base, moved))
+    return shifted
+
+
+# --------------------------------------------------------------------------
+# per-hour density
+# --------------------------------------------------------------------------
+def weighted_quantile(sorted_pts, total, tau):
+    acc = 0.0
+    for w, x in sorted_pts:
+        acc += w
+        if acc >= tau * total:
+            return x
+    return sorted_pts[-1][1]
+
+
+def silverman(pts):
+    """Silverman bandwidth for weighted points [(w, x)], clamped."""
+    total = sum(w for w, _ in pts)
+    n_eff = total ** 2 / sum(w * w for w, _ in pts)
+    mean = sum(w * x for w, x in pts) / total
+    sd = math.sqrt(sum(w * (x - mean) ** 2 for w, x in pts) / total)
+    ordered = sorted(pts, key=lambda t: t[1])
+    iqr = (weighted_quantile(ordered, total, 0.75)
+           - weighted_quantile(ordered, total, 0.25)) / 1.349
     spread = min(sd, iqr) if iqr > 0 else sd
-    bw = 0.9 * spread * n_eff ** -0.2
-    return min(max(bw, 0.05), KERNEL_SD)
+    return min(max(0.9 * spread * n_eff ** -0.2, MIN_BW), KERNEL_SD)
 
 
-def norm_cdf(x):
+def phi(x):
     return 0.5 * math.erfc(-x / math.sqrt(2.0))
 
 
-def mixture_quantile(components, tau):
-    """components: list of (weight, mean, sd) in log space."""
-    total = sum(c[0] for c in components)
-    lo = min(c[1] - 8 * c[2] for c in components)
-    hi = max(c[1] + 8 * c[2] for c in components)
+def mixture_quantile(kernels, tau):
+    """Quantile of a Gaussian mixture [(weight, mean, sd)] via bisection."""
+    total = sum(k[0] for k in kernels)
+    lo = min(m - 8 * s for _, m, s in kernels)
+    hi = max(m + 8 * s for _, m, s in kernels)
     for _ in range(100):
         mid = 0.5 * (lo + hi)
-        cdf = sum(w * norm_cdf((mid - m) / s) for w, m, s in components) / total
+        cdf = sum(w * phi((mid - m) / s) for w, m, s in kernels) / total
         if cdf < tau:
             lo = mid
         else:
@@ -147,74 +213,73 @@ def mixture_quantile(components, tau):
     return 0.5 * (lo + hi)
 
 
-def forecast_case(case):
-    known = case.get("known") or []
+def hour_quantiles(log_p, kernels):
+    out = []
+    floor = 0.0
+    for tau in LEVELS:
+        q = math.exp(log_p + mixture_quantile(kernels, tau))
+        q = round(max(min(max(q, 0.01), 1e9), floor), 2)
+        q = max(q, floor)
+        out.append(q)
+        floor = q
+    return out
+
+
+# --------------------------------------------------------------------------
+# case driver
+# --------------------------------------------------------------------------
+def hour1_viewers(case):
     p = None
-    for row in known:
+    for row in case.get("known") or []:
         if row.get("hour") == 1:
             p = row.get("viewers")
     try:
         p = float(p)
     except (TypeError, ValueError):
-        p = 1.0
-    if not math.isfinite(p) or p < 1:
-        p = 1.0
-    logp = math.log(p)
+        return 1.0
+    return p if math.isfinite(p) and p >= 1 else 1.0
 
-    target_offset = us_east_unlock_offset(parse_ts(case["day_start"]).date())
+
+def forecast_case(case):
+    p = hour1_viewers(case)
+    log_p = math.log(p)
+    unlock = east_midnight_hour(to_utc(case["day_start"]).date())
+
     comps = []
-    for comp in case.get("comparables") or []:
+    for raw in case.get("comparables") or []:
         try:
-            lr, w = comp_log_ratios(comp, target_offset)
+            c = build_comparable(raw, unlock)
         except (KeyError, TypeError, ValueError):
             continue
-        if lr:
-            comps.append((lr, w))
+        if c is not None:
+            comps.append(c)
+    comps = adjust_for_size(comps, log_p)
 
-    # Size effect: smaller hour-1 prints grow more over the day.  Per hour, a
-    # weighted least-squares slope of the comps' log ratio on log(hour 1);
-    # the target's hour 1 is capped to the comps' range.
-    if len(comps) >= 4:
-        lo_b = min(lr[0] for lr, _ in comps)
-        hi_b = max(lr[0] for lr, _ in comps)
-        tgt = min(max(logp, lo_b), hi_b)
-        def hslope(h):
-            pts = [(w, lr[0], lr[h]) for lr, w in comps if h in lr]
-            sw = sum(w for w, _, _ in pts)
-            if len(pts) < 4 or sw <= 0:
-                return 0.0
-            mx = sum(w * x for w, x, _ in pts) / sw
-            my = sum(w * y for w, _, y in pts) / sw
-            sxx = sum(w * (x - mx) ** 2 for w, x, _ in pts)
-            b = sum(w * (x - mx) * (y - my) for w, x, y in pts) / sxx if sxx > 0 else 0.0
-            return min(0.0, max(-SLOPE_CAP, b))
-        hs = {h: hslope(h) for h in range(2, 25)}
-        comps = [({k: (v + hs[k] * (tgt - lr[0]) if k > 0 else v) for k, v in lr.items()}, w)
-                 for lr, w in comps]
+    hours = []
+    for h in HOURS:
+        kernels = [(PRIOR_STRENGTH, 0.0, HOUSE_SD_PER_HOUR * math.sqrt(h - 1))]
+        pts = [(c.weight, c.ratios[h]) for c in comps if h in c.ratios]
+        if sum(w for w, _ in pts) > 0:
+            bw = silverman(pts)
+            kernels.extend((w, x, bw) for w, x in pts)
+        hours.append({"hour": h, "q": hour_quantiles(log_p, kernels)})
+    return {"hours": hours}
 
-    rows = []
-    for h in range(2, 25):
-        house_sd = 0.15 * math.sqrt(h - 1)
-        pts = [(w, lr[h]) for lr, w in comps if h in lr]
-        n_eff = sum(w for w, _ in pts)
-        mix = [(PRIOR_STRENGTH, 0.0, house_sd)]
-        if n_eff > 0:
-            bw = silverman_bw(pts)
-            for w, x in pts:
-                mix.append((w, x, bw))
-        qs = []
-        prev = 0.0
-        for tau in LEVELS:
-            q = math.exp(logp + mixture_quantile(mix, tau))
-            q = min(max(q, 0.01), 1e9)
-            q = max(q, prev)
-            q = round(q, 2)
-            if q < prev:
-                q = prev
-            prev = q
-            qs.append(q)
-        rows.append({"hour": h, "q": qs})
-    return {"hours": rows}
+
+def house_forecast(case):
+    """Starter fallback: lognormal around hour 1."""
+    p = 1.0
+    for row in case.get("known") or []:
+        if row.get("hour") == 1:
+            try:
+                p = max(1.0, float(row.get("viewers")))
+            except (TypeError, ValueError):
+                p = 1.0
+    hours = []
+    for h in HOURS:
+        sd = HOUSE_SD_PER_HOUR * math.sqrt(h - 1)
+        hours.append({"hour": h, "q": [round(p * math.exp(z * sd), 2) for z in HOUSE_Z]})
+    return {"hours": hours}
 
 
 def main():
@@ -224,30 +289,15 @@ def main():
     for name in sorted(os.listdir(in_dir)):
         if not name.endswith(".in"):
             continue
-        path = os.path.join(in_dir, name)
-        with open(path, encoding="utf-8") as f:
-            case = json.load(f)
-        cid = case.get("id") or name[:-3]
+        with open(os.path.join(in_dir, name), encoding="utf-8") as fh:
+            case = json.load(fh)
+        case_id = case.get("id") or name[:-3]
         try:
             result = forecast_case(case)
         except Exception:
             result = house_forecast(case)
-        with open(os.path.join(out_dir, cid + ".out"), "w", encoding="utf-8") as f:
-            json.dump(result, f, separators=(",", ":"))
-
-
-def house_forecast(case):
-    p = 1.0
-    for row in case.get("known") or []:
-        if row.get("hour") == 1:
-            try:
-                p = max(1.0, float(row.get("viewers")))
-            except (TypeError, ValueError):
-                p = 1.0
-    rows = []
-    for h in range(2, 25):
-        rows.append({"hour": h, "q": [round(p * math.exp(z * 0.15 * math.sqrt(h - 1)), 2) for z in Z]})
-    return {"hours": rows}
+        with open(os.path.join(out_dir, case_id + ".out"), "w", encoding="utf-8") as fh:
+            json.dump(result, fh, separators=(",", ":"))
 
 
 if __name__ == "__main__":
