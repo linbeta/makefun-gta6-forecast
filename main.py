@@ -10,11 +10,12 @@ Model (standard library only, deterministic, no network):
   * Keep the launches that look like console midnight-local unlocks; drop
     single-global / PC-only / early-access / free-to-play launches and any
     curve whose hour 1 was clearly pre-unlock (day max far above hour 1).
-  * Size effect: smaller launches grow more over the day.  One weighted slope
-    of each comparable's mean log ratio on log(its hour 1) is fitted at
-    runtime and shifts every comparable's ratios to the target's hour-1 size
-    (capped to the comparables' size range; slope bounded to [-0.5, 0]).
-  * Per hour, the log ratios form a weighted kernel mixture.  It is blended
+  * Size effect: smaller launches grow more over the day.  For each hour, a
+    weighted slope of the comparables' log ratio on log(their hour 1) is
+    fitted at runtime and shifts that hour's ratios to the target's hour-1
+    size (capped to the comparables' size range; slope bounded to [-0.5, 0]).
+  * Per hour, the log ratios form a weighted kernel mixture whose bandwidth
+    follows Silverman's rule on those ratios (capped at KERNEL_SD).  It is blended
     with the house baseline (lognormal around the hour-1 print with log sd
     0.15*sqrt(h-1)) with weight that grows as comparables run out, and the five
     quantiles are read off the mixture CDF.
@@ -29,7 +30,7 @@ LEVELS = [0.05, 0.25, 0.5, 0.75, 0.95]
 Z = [-1.645, -0.674, 0.0, 0.674, 1.645]
 
 # Model constants (fixed by reasoning, not tuned per practice hour).
-KERNEL_SD = 0.20          # log-scale smoothing around each comparable's ratio
+KERNEL_SD = 0.20          # upper bound on the per-hour kernel bandwidth
 PRIOR_STRENGTH = 3.0      # pseudo-count of the house baseline in the blend
 SLOPE_CAP = 0.5           # |size slope| bound (log ratio per log hour-1 viewers)
 MAX_DAY_RATIO = 15.0      # hour 1 below 1/15 of the day max => pre-unlock hour 1
@@ -107,6 +108,26 @@ def comp_log_ratios(comp, target_offset):
     return out, w
 
 
+def silverman_bw(pts):
+    """Silverman's rule (weighted, robust spread) for one hour's log ratios."""
+    n_eff = sum(w for w, _ in pts) ** 2 / sum(w * w for w, _ in pts)
+    sw = sum(w for w, _ in pts)
+    m = sum(w * x for w, x in pts) / sw
+    sd = math.sqrt(sum(w * (x - m) ** 2 for w, x in pts) / sw)
+    xs = sorted(pts, key=lambda t: t[1])
+    def wq(t):
+        acc = 0.0
+        for w, x in xs:
+            acc += w
+            if acc >= t * sw:
+                return x
+        return xs[-1][1]
+    iqr = (wq(0.75) - wq(0.25)) / 1.349
+    spread = min(sd, iqr) if iqr > 0 else sd
+    bw = 0.9 * spread * n_eff ** -0.2
+    return min(max(bw, 0.05), KERNEL_SD)
+
+
 def norm_cdf(x):
     return 0.5 * math.erfc(-x / math.sqrt(2.0))
 
@@ -150,24 +171,25 @@ def forecast_case(case):
         if lr:
             comps.append((lr, w))
 
-    # Size effect: smaller hour-1 prints grow more over the day.  One weighted
-    # least-squares slope of each comparable's mean log ratio on log(hour 1),
-    # applied to every hour; the target's hour 1 is capped to the comps' range.
-    slope = 0.0
+    # Size effect: smaller hour-1 prints grow more over the day.  Per hour, a
+    # weighted least-squares slope of the comps' log ratio on log(hour 1);
+    # the target's hour 1 is capped to the comps' range.
     if len(comps) >= 4:
-        xs = [(w, lr[0], sum(v for k, v in lr.items() if k > 0) / (len(lr) - 1))
-              for lr, w in comps]
-        sw = sum(w for w, _, _ in xs)
-        mx = sum(w * x for w, x, _ in xs) / sw
-        my = sum(w * y for w, _, y in xs) / sw
-        sxx = sum(w * (x - mx) ** 2 for w, x, _ in xs)
-        if sxx > 0:
-            slope = sum(w * (x - mx) * (y - my) for w, x, y in xs) / sxx
-        slope = min(0.0, max(-SLOPE_CAP, slope))
         lo_b = min(lr[0] for lr, _ in comps)
         hi_b = max(lr[0] for lr, _ in comps)
         tgt = min(max(logp, lo_b), hi_b)
-        comps = [({k: (v + slope * (tgt - lr[0]) if k > 0 else v) for k, v in lr.items()}, w)
+        def hslope(h):
+            pts = [(w, lr[0], lr[h]) for lr, w in comps if h in lr]
+            sw = sum(w for w, _, _ in pts)
+            if len(pts) < 4 or sw <= 0:
+                return 0.0
+            mx = sum(w * x for w, x, _ in pts) / sw
+            my = sum(w * y for w, _, y in pts) / sw
+            sxx = sum(w * (x - mx) ** 2 for w, x, _ in pts)
+            b = sum(w * (x - mx) * (y - my) for w, x, y in pts) / sxx if sxx > 0 else 0.0
+            return min(0.0, max(-SLOPE_CAP, b))
+        hs = {h: hslope(h) for h in range(2, 25)}
+        comps = [({k: (v + hs[k] * (tgt - lr[0]) if k > 0 else v) for k, v in lr.items()}, w)
                  for lr, w in comps]
 
     rows = []
@@ -177,9 +199,9 @@ def forecast_case(case):
         n_eff = sum(w for w, _ in pts)
         mix = [(PRIOR_STRENGTH, 0.0, house_sd)]
         if n_eff > 0:
-            scale = n_eff  # comparables share weight n_eff in total
+            bw = silverman_bw(pts)
             for w, x in pts:
-                mix.append((w * scale / n_eff, x, KERNEL_SD))
+                mix.append((w, x, bw))
         qs = []
         prev = 0.0
         for tau in LEVELS:
